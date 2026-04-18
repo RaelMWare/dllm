@@ -258,8 +258,9 @@ class TerminalVisualizer(BaseVisualizer):
 
         # ---------- rich live UI ----------
         # replaced fixed height=100 with the estimated height from history[-1]
+        in_jupyter = "ipykernel" in sys.modules
         console = Console(
-            force_terminal=True,
+            force_terminal=not in_jupyter,
             color_system="truecolor",
             width=term_width,
             height=est_height,

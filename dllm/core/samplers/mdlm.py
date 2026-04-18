@@ -1,5 +1,71 @@
 """
 reference: https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
+
+Remasking
+=========
+The default LLaDA inference uses a fixed, pre-computed schedule: the total
+number of masked tokens is divided evenly across ``steps`` diffusion steps
+(with the linear alpha scheduler), and each committed token is permanently
+frozen.
+
+Setting ``dynamic_unmasking=True`` in ``MDLMSamplerConfig`` adds a remasking
+step on top of the original schedule.  Everything else — block structure,
+number of tokens revealed per step, confidence-based selection — stays
+identical.
+
+The only addition: after each forward pass, committed (non-prompt) positions
+are checked.  If the model now *confidently* predicts a different token
+(softmax prob > ``remask_threshold``) and the position's cooldown
+(``remask_cooldown`` steps since last commit) has elapsed, the position is
+set back to ``mask_id``.  Remasked positions re-enter the candidate pool and
+are naturally filled in subsequent steps by the existing schedule.
+
+This addresses a specific failure mode: tokens committed early (when most of
+the canvas is still masked) may be wrong because the model lacked context.
+With chain-of-thought reasoning, a single wrong token in an intermediate step
+(e.g. ``9 - 9 = 2``) poisons all downstream steps.  Remasking lets the model
+correct such errors once more context is available.
+
+Parameters:
+    ``dynamic_unmasking`` (bool, default False): enable remasking.
+    ``remask_threshold`` (float, default 0.9): minimum confidence for the
+        model's *new* prediction to trigger a remask.
+    ``remask_cooldown`` (int, default 3): minimum steps after commit before
+        a position can be remasked (prevents oscillation).
+
+Stale-Token Remasking (opt-in, separate from ``dynamic_unmasking``)
+===================================================================
+``dynamic_unmasking`` checks whether the model wants to *change* a committed
+token under the current canvas.  That trigger rarely fires on stable wrong
+commits because the surrounding canvas was generated to be consistent with
+the wrong token — the model rationalises around it and the distribution at
+that position stays peaked on the (wrong) committed value.
+
+``stale_remasking=True`` checks a different question: "if this position were
+masked right now, what would the model predict?"  An extra forward pass is
+run on a copy of the canvas with all committed (non-prompt) positions in
+the generation zone replaced by ``mask_id``.  At each committed position,
+if the currently-committed token is **not** in the top-``stale_topk``
+predictions of that counterfactual distribution, the position is remasked.
+
+This catches stale commits the disagreement trigger misses: cases where the
+model is locally consistent but would have predicted something different
+had it not seen its own previous commit there.
+
+Parameters:
+    ``stale_remasking`` (bool, default False): enable Signal-A remasking.
+    ``stale_topk`` (int, default 5): a committed token is considered stale
+        if it is not among the model's top-K predictions when its position
+        is masked.
+
+The two remasking modes share ``remask_cooldown`` and can be combined; they
+target different failure modes and compose naturally.
+
+Cost: stale remasking adds one extra forward pass per diffusion step
+(roughly 2x compute when enabled).
+
+All parameters default to conservative values and every remasking feature
+is off by default, so existing behaviour is unchanged.
 """
 
 import math
@@ -29,6 +95,13 @@ class MDLMSamplerConfig(BaseSamplerConfig):
     suppress_tokens: list[int] | None = None
     begin_suppress_tokens: list[int] | None = None
     right_shift_logits: bool = False
+    # Remasking options (opt-in)
+    dynamic_unmasking: bool = False
+    remask_threshold: float = 0.9
+    remask_cooldown: int = 3
+    # Stale-token remasking (Signal A) — independent opt-in
+    stale_remasking: bool = False
+    stale_topk: int = 5
 
 
 @dataclass
@@ -75,6 +148,11 @@ class MDLMSampler(BaseSampler):
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
+        dynamic_unmasking = kwargs.get("dynamic_unmasking", config.dynamic_unmasking)
+        remask_threshold = kwargs.get("remask_threshold", config.remask_threshold)
+        remask_cooldown = kwargs.get("remask_cooldown", config.remask_cooldown)
+        stale_remasking = kwargs.get("stale_remasking", config.stale_remasking)
+        stale_topk = kwargs.get("stale_topk", config.stale_topk)
 
         assert 1 <= block_size
         assert 1 <= steps
@@ -130,6 +208,15 @@ class MDLMSampler(BaseSampler):
         num_blocks = math.ceil(max_new_tokens / block_size)
         steps = math.ceil(steps / num_blocks)  # per-block step budget
         histories = [x.clone()] if return_dict else None
+
+        # Remasking tracking (used when dynamic_unmasking or stale_remasking is on)
+        if dynamic_unmasking or stale_remasking:
+            gen_zone = torch.zeros((B, T), dtype=torch.bool, device=x.device)
+            for j in range(B):
+                gen_zone[j, prompt_lens[j] : prompt_lens[j] + max_new_tokens] = True
+            committed_step = torch.full(
+                (B, T), -remask_cooldown - 1, dtype=torch.long, device=x.device
+            )
 
         for b in range(num_blocks):
             # Build a per-sample mask *within this block* (aligned to each prompt's tail)
@@ -206,6 +293,41 @@ class MDLMSampler(BaseSampler):
                 else:
                     raise NotImplementedError(remasking)
 
+                # ----- Remasking: check committed positions for disagreement -----
+                if dynamic_unmasking:
+                    committed = gen_zone & ~mask_index
+                    disagrees = committed & (x0 != x)
+                    confident_new = disagrees & (x0_p > remask_threshold)
+                    cooldown_ok = committed_step <= (i + b * steps - remask_cooldown)
+                    remask_positions = confident_new & cooldown_ok
+
+                    x[remask_positions] = mask_id
+                    mask_index = x == mask_id  # recompute after remasking
+
+                # ----- Stale-token remasking (Signal A): committed token not in
+                # top-K of the model's prediction when its position is masked -----
+                if stale_remasking:
+                    committed = gen_zone & ~mask_index
+                    if committed.any():
+                        x_check = x.clone()
+                        x_check[committed] = mask_id
+                        check_logits = self.model(
+                            x_check, attention_mask=attention_mask
+                        ).logits
+                        if right_shift_logits:
+                            check_logits = torch.cat(
+                                [check_logits[:, :1], check_logits[:, :-1]], dim=1
+                            )
+                        check_p = F.softmax(check_logits, dim=-1)
+                        _, topk_ids = check_p.topk(stale_topk, dim=-1)  # [B,T,K]
+                        in_topk = (topk_ids == x.unsqueeze(-1)).any(dim=-1)
+                        cooldown_ok = committed_step <= (
+                            i + b * steps - remask_cooldown
+                        )
+                        stale_positions = committed & ~in_topk & cooldown_ok
+                        x[stale_positions] = mask_id
+                        mask_index = x == mask_id  # recompute after remasking
+
                 # Restrict selection window to the *current block's* tail region
                 for j in range(B):
                     x0_p[j, prompt_lens[j] + (b + 1) * block_size :] = -np.inf
@@ -221,13 +343,18 @@ class MDLMSampler(BaseSampler):
                     x0, dtype=torch.bool, device=x0.device
                 )
                 for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(
-                        confidence[j], k=num_transfer_tokens[j, i]
-                    )
-                    transfer_index[j, select_index] = True
+                    k = num_transfer_tokens[j, i]
+                    # If remasking added more masks than k covers, clamp to available
+                    n_available = (confidence[j] > -np.inf).sum().item()
+                    k = min(k, n_available)
+                    if k > 0:
+                        _, select_index = torch.topk(confidence[j], k=k)
+                        transfer_index[j, select_index] = True
 
                 # Commit chosen predictions into the canvas
                 x[transfer_index] = x0[transfer_index]
+                if dynamic_unmasking or stale_remasking:
+                    committed_step[transfer_index] = i + b * steps
                 if histories is not None:
                     histories.append(x.clone())
 
