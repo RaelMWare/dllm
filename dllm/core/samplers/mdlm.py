@@ -3,14 +3,12 @@ reference: https://github.com/ML-GSAI/LLaDA/blob/main/generate.py
 
 Remasking
 =========
-The default LLaDA inference uses a fixed, pre-computed schedule: the total
-number of masked tokens is divided evenly across ``steps`` diffusion steps
-(with the linear alpha scheduler), and each committed token is permanently
-frozen.
+
+Rael notes about the modifications made
 
 Setting ``dynamic_unmasking=True`` in ``MDLMSamplerConfig`` adds a remasking
-step on top of the original schedule.  Everything else — block structure,
-number of tokens revealed per step, confidence-based selection — stays
+step on top of the original schedule.  Everything else inlcuding the block structure,
+number of tokens revealed per step, confidence-based selection stays
 identical.
 
 The only addition: after each forward pass, committed (non-prompt) positions
@@ -20,10 +18,8 @@ are checked.  If the model now *confidently* predicts a different token
 set back to ``mask_id``.  Remasked positions re-enter the candidate pool and
 are naturally filled in subsequent steps by the existing schedule.
 
-This addresses a specific failure mode: tokens committed early (when most of
-the canvas is still masked) may be wrong because the model lacked context.
-With chain-of-thought reasoning, a single wrong token in an intermediate step
-(e.g. ``9 - 9 = 2``) poisons all downstream steps.  Remasking lets the model
+This  aims to address a specific failure mode: tokens committed early (when most of
+the canvas is still masked) may be wrong because the model lacked context. Remasking lets the model
 correct such errors once more context is available.
 
 Parameters:
@@ -33,39 +29,6 @@ Parameters:
     ``remask_cooldown`` (int, default 3): minimum steps after commit before
         a position can be remasked (prevents oscillation).
 
-Stale-Token Remasking (opt-in, separate from ``dynamic_unmasking``)
-===================================================================
-``dynamic_unmasking`` checks whether the model wants to *change* a committed
-token under the current canvas.  That trigger rarely fires on stable wrong
-commits because the surrounding canvas was generated to be consistent with
-the wrong token — the model rationalises around it and the distribution at
-that position stays peaked on the (wrong) committed value.
-
-``stale_remasking=True`` checks a different question: "if this position were
-masked right now, what would the model predict?"  An extra forward pass is
-run on a copy of the canvas with all committed (non-prompt) positions in
-the generation zone replaced by ``mask_id``.  At each committed position,
-if the currently-committed token is **not** in the top-``stale_topk``
-predictions of that counterfactual distribution, the position is remasked.
-
-This catches stale commits the disagreement trigger misses: cases where the
-model is locally consistent but would have predicted something different
-had it not seen its own previous commit there.
-
-Parameters:
-    ``stale_remasking`` (bool, default False): enable Signal-A remasking.
-    ``stale_topk`` (int, default 5): a committed token is considered stale
-        if it is not among the model's top-K predictions when its position
-        is masked.
-
-The two remasking modes share ``remask_cooldown`` and can be combined; they
-target different failure modes and compose naturally.
-
-Cost: stale remasking adds one extra forward pass per diffusion step
-(roughly 2x compute when enabled).
-
-All parameters default to conservative values and every remasking feature
-is off by default, so existing behaviour is unchanged.
 """
 
 import math
