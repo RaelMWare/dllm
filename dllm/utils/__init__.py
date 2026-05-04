@@ -43,7 +43,7 @@ from .utils import (
     pprint_main,
     resolve_with_base_env,
 )
-from .visualizers import BaseVisualizer, TerminalVisualizer, VideoVisualizer
+from .visualizers import BaseVisualizer, DiffViewer, TableDiffViewer, TerminalVisualizer, VideoVisualizer
 
 __all__ = [
     "chat",
@@ -103,6 +103,8 @@ __all__ = [
     "resolve_with_base_env",
     # visualizers
     "BaseVisualizer",
+    "DiffViewer",
+    "TableDiffViewer",
     "TerminalVisualizer",
     "VideoVisualizer",
 ]

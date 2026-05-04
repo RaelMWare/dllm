@@ -424,5 +424,196 @@ class TerminalVisualizer(BaseVisualizer):
         return s[:max_chars]
 
 
+class DiffViewer:
+    """Step-through viewer for LLaDA denoising histories.
+
+    Works with both sampler.sample() and sampler.infill() when return_dict=True.
+
+    Usage:
+        out = sampler.infill([input_ids], cfg)
+        viewer = DiffViewer(out.histories, tokenizer)
+        viewer.next()   # show step 0 → 1
+        viewer.next()   # show step 1 → 2
+        viewer.goto(10) # jump to step 10
+        viewer.prev()   # go back
+    """
+
+    SHORT = {
+        "<|startoftext|>":     "<bos>",
+        "<|begin_of_text|>":   "<bos>",
+        "<|endoftext|>":       "<eos>",
+        "<|eot_id|>":          "<eot>",
+        "<|start_header_id|>": "<[",
+        "<|end_header_id|>":   "]>",
+    }
+    TOKEN_WIDTH, TOKENS_PER_LINE = 7, 18
+    GREEN  = "\033[42;30m"
+    RED    = "\033[41;97m"
+    YELLOW = "\033[43;30m"
+    RESET  = "\033[0m"
+
+    def __init__(self, histories, tokenizer):
+        self.histories = histories
+        self.tokenizer = tokenizer
+        self.mask_id   = tokenizer.mask_token_id
+        self.end_hdr_id = tokenizer.convert_tokens_to_ids("<|end_header_id|>")
+        self.step = -1
+        self.sep_width = self.TOKEN_WIDTH * self.TOKENS_PER_LINE + (self.TOKENS_PER_LINE - 1)
+
+    def _render(self, tid):
+        if tid == self.mask_id:
+            s = "_"
+        else:
+            raw = self.tokenizer.decode([tid])
+            s = self.SHORT.get(raw, raw).replace("\n", "⏎").replace("\t", "→").strip() or "·"
+        return s[:self.TOKEN_WIDTH].ljust(self.TOKEN_WIDTH)
+
+    def show(self, step=None):
+        if step is not None:
+            self.step = step
+        self.step = max(0, min(self.step, len(self.histories) - 1))
+
+        ids_now  = self.histories[self.step][0].tolist()
+        ids_prev = self.histories[self.step - 1][0].tolist() if self.step > 0 else ids_now
+
+        cells = []
+        for prev, now in zip(ids_prev, ids_now):
+            cell = self._render(now)
+            if prev != now:
+                if   prev == self.mask_id: color = self.GREEN
+                elif now  == self.mask_id: color = self.RED
+                else:                      color = self.YELLOW
+                cell = f"{color}{cell}{self.RESET}"
+            cells.append(cell)
+
+        hdr_pos  = [i for i, t in enumerate(ids_now) if t == self.end_hdr_id]
+        boundary = (hdr_pos[1] + 1) if len(hdr_pos) >= 2 else len(ids_now)
+
+        print(f"--- Step {self.step} / {len(self.histories) - 1} ---  "
+              f"green=committed  red=remasked  yellow=swapped")
+        for label, start, end in [("prompt",   0,        boundary),
+                                   ("response", boundary, len(ids_now))]:
+            chunk = cells[start:end]
+            print(f"── {label} " + "─" * max(1, self.sep_width - len(label) - 4))
+            for i in range(0, len(chunk), self.TOKENS_PER_LINE):
+                print(" ".join(chunk[i:i + self.TOKENS_PER_LINE]))
+
+    def next(self): self.step += 1; self.show()
+    def prev(self): self.step -= 1; self.show()
+    def goto(self, n): self.show(step=n)
+
+
+class TableDiffViewer:
+    """Tabular step-through viewer for LLaDA infill denoising histories.
+
+    Shows a pandas DataFrame where rows = pet rows, columns = masked fields.
+    Newly committed cells are highlighted green; still-masked cells show '_'.
+
+    Usage:
+        out = sampler.infill([input_ids], cfg)
+        tv = TableDiffViewer(out.histories, tokenizer, runs, keys)
+        tv.next()    # step 0 → 1
+        tv.goto(16)  # jump to step 16
+        tv.prev()
+    """
+
+    def __init__(self, histories, tokenizer, runs, keys, rows_df=None, max_cell_chars=40):
+        """
+        runs  : list of (start, end) token index pairs for each masked cell
+        keys  : list of (row_idx, col_name, orig_value) matching runs order
+        rows_df : optional original DataFrame; if given, non-masked cells show their original values
+        max_cell_chars : truncate displayed cells to this many characters
+        """
+        import pandas as pd
+        self.histories = histories
+        self.tokenizer = tokenizer
+        self.mask_id   = tokenizer.mask_token_id
+        self.runs      = runs
+        self.keys      = keys
+        self.rows_df   = rows_df
+        self.max_cell_chars = max_cell_chars
+        self.step      = -1
+        self._pd       = pd
+
+        self.row_indices = sorted({r for r, _, _ in keys})
+        self.col_names   = list(dict.fromkeys(c for _, c, _ in keys))
+
+    def _orig_for(self, r, col):
+        if self.rows_df is None:
+            return ""
+        try:
+            v = self.rows_df.loc[r, col]
+        except Exception:
+            return ""
+        if v is None:
+            return ""
+        s = str(v)
+        if self.max_cell_chars and len(s) > self.max_cell_chars:
+            s = s[: self.max_cell_chars - 1] + "…"
+        return s
+
+    def _decode_cell(self, ids, start, end):
+        toks = ids[start:end]
+        if all(t == self.mask_id for t in toks):
+            return "_"
+        return self.tokenizer.decode(toks).strip() or "_"
+
+    def show(self, step=None):
+        if step is not None:
+            self.step = step
+        self.step = max(0, min(self.step, len(self.histories) - 1))
+
+        ids_now  = self.histories[self.step][0].tolist()
+        ids_prev = self.histories[self.step - 1][0].tolist() if self.step > 0 else ids_now
+
+        # build value and "newly committed" flag per (row, col)
+        values    = {}
+        new_this  = set()
+        for (start, end), (row_i, col, orig) in zip(self.runs, self.keys):
+            val      = self._decode_cell(ids_now,  start, end)
+            val_prev = self._decode_cell(ids_prev, start, end)
+            values[(row_i, col)] = val
+            if val != "_" and val_prev == "_":
+                new_this.add((row_i, col))
+
+        df = self._pd.DataFrame(
+            index=self.row_indices,
+            columns=self.col_names,
+            data={
+                col: [
+                    values[(r, col)] if (r, col) in values else self._orig_for(r, col)
+                    for r in self.row_indices
+                ]
+                for col in self.col_names
+            },
+        )
+        df.index.name = "row"
+
+        total = len(self.histories) - 1
+        filled = sum(1 for v in values.values() if v != "_")
+        print(f"Step {self.step}/{total}  |  filled {filled}/{len(self.runs)}  "
+              f"|  committed this step: {len(new_this)}")
+
+        def highlight(val_series):
+            styles = []
+            for row_i, col in zip(val_series.index, [val_series.name] * len(val_series)):
+                if (row_i, col) in new_this:
+                    styles.append("background-color: #c6efce; color: #276221")
+                elif val_series[row_i] == "_":
+                    styles.append("color: #aaaaaa")
+                else:
+                    styles.append("")
+            return styles
+
+        try:
+            return df.style.apply(highlight, axis=0)
+        except Exception:
+            return df
+
+    def next(self): self.step += 1; return self.show()
+    def prev(self): self.step -= 1; return self.show()
+    def goto(self, n): return self.show(step=n)
+
+
 if __name__ == "__main__":
     pass
